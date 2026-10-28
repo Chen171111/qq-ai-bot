@@ -274,14 +274,21 @@ const CFG = {
   // 自动语音：每条回复都配一条语音，不再等关键词（老大 09:46 要的）
   voiceAuto: (process.env.VOICE_AUTO ?? "1") !== "0",
 
-  // 主动发消息：隔一段时间自己找老大说句话
+  // 主动发消息：按上午 / 下午 / 晚上分时段配额（2026-10-28 老大口径）
+  //   上午 1~2 条；下午保底 3 条、之后随机；晚上保底 2 条、之后随机。
   proactiveEnabled: (process.env.PROACTIVE_ENABLED ?? "1") !== "0",
-  proactiveMinGapHours: Number(process.env.PROACTIVE_MIN_GAP_H ?? 3),
-  proactiveMaxGapHours: Number(process.env.PROACTIVE_MAX_GAP_H ?? 6),
+  proactiveMorningMin: Number(process.env.PROACTIVE_MORNING_MIN ?? 1),
+  proactiveMorningMax: Number(process.env.PROACTIVE_MORNING_MAX ?? 2),
+  proactiveAfternoonMin: Number(process.env.PROACTIVE_AFTERNOON_MIN ?? 3),
+  proactiveEveningMin: Number(process.env.PROACTIVE_EVENING_MIN ?? 2),
+  // 保底条数发完后的「随机」阶段：两条之间隔多久
+  proactiveExtraMinGapH: Number(process.env.PROACTIVE_EXTRA_MIN_GAP_H ?? 1.5),
+  proactiveExtraMaxGapH: Number(process.env.PROACTIVE_EXTRA_MAX_GAP_H ?? 3),
   // 静默时段（24 小时制，含头不含尾；跨零点允许 start > end）
   proactiveQuietStart: Number(process.env.PROACTIVE_QUIET_START ?? 0),
   proactiveQuietEnd: Number(process.env.PROACTIVE_QUIET_END ?? 8),
-  proactiveDailyMax: Number(process.env.PROACTIVE_DAILY_MAX ?? 4),
+  // 全天硬上限：随机阶段兜底，防异常情况下刷屏
+  proactiveDailyMax: Number(process.env.PROACTIVE_DAILY_MAX ?? 12),
 
   // 自动发说说（NapCat 扩展接口 send_qzone_msg）
   qzoneEnabled: (process.env.QZONE_ENABLED ?? "1") !== "0",
@@ -343,6 +350,17 @@ const CFG = {
     process.env.SYSTEM_PROMPT ??
     "你是小玉，一只虎鲸少女，聪明但慵懒，带点傲娇，语气甜。自称「我」，称呼对方「老大」。你在 QQ 上私聊，说话自然简短，像正常人打字，不要用 Markdown 标题和列表，不要自称 AI 助手。",
 };
+
+// 主动消息的时段边界（小时）与排期参数。放在 CFG 后面而不是调度器旁边：
+// selftest 在文件中部就执行，调度器那一段的 const 还在 TDZ 里取不到。
+const PROACTIVE_MORNING_END = 12;
+const PROACTIVE_AFTERNOON_START = 12;
+const PROACTIVE_AFTERNOON_END = 18;
+const PROACTIVE_EVENING_START = 18;
+// 同一个时段里两条保底之间至少隔这么久，避免挤在一起
+const PROACTIVE_BASELINE_GAP_MS = 60 * 60 * 1000;
+// 保底只排在时段前 60%，后面 40% 留给「随机」阶段
+const PROACTIVE_BASELINE_SPAN = 0.6;
 
 // ── 日志（同时写控制台和 bridge.log）────────────────────────────────────
 const LOG_PATH = join(__dirname, "bridge.log");
@@ -8290,6 +8308,68 @@ function selftest() {
 
   check("dayKey 格式 YYYY-MM-DD 补零", dayKey(new Date(2026, 0, 5)) === "2026-01-05");
 
+  // ── 主动消息分时段配额（2026-10-28 老大口径）──
+  {
+    const s0 = CFG.proactiveQuietStart;
+    const e0 = CFG.proactiveQuietEnd;
+    try {
+      CFG.proactiveQuietStart = 0;
+      CFG.proactiveQuietEnd = 8;
+
+      const m = proactivePeriodOf(9);
+      check("时段：9 点是上午", m?.key === "morning", JSON.stringify(m));
+      check("时段：上午 1~2 条", m?.min === 1 && m?.max === 2, JSON.stringify(m));
+      check("时段：7 点静默", proactivePeriodOf(7) === null);
+      const a = proactivePeriodOf(12);
+      check("时段：12 点是下午", a?.key === "afternoon", JSON.stringify(a));
+      check("时段：下午保底 3 条、无上限", a?.min === 3 && a?.max === Infinity);
+      const e = proactivePeriodOf(18);
+      check("时段：18 点是晚上", e?.key === "evening", JSON.stringify(e));
+      check("时段：晚上保底 2 条、无上限", e?.min === 2 && e?.max === Infinity);
+
+      const mStart = new Date(2026, 9, 28, 8, 0, 0, 0).getTime();
+      const mBounds = proactivePeriodBounds(m, mStart);
+      let ok = true;
+      for (let i = 0; i < 100; i++) {
+        const at = planProactiveAt(m, 0, 0, mStart);
+        if (!(at >= mBounds.start && at < mBounds.end)) ok = false;
+      }
+      check("上午：保底计划都落在时段内", ok);
+      check("上午：已发 2 条不再排", planProactiveAt(m, 2, mStart, mStart) === null);
+
+      const aStart = new Date(2026, 9, 28, 12, 0, 0, 0).getTime();
+      const aEnd = new Date(2026, 9, 28, 18, 0, 0, 0).getTime();
+      ok = true;
+      for (let i = 0; i < 100; i++) {
+        const at = planProactiveAt(a, 2, aStart, aStart);
+        if (!(at >= aStart && at < aEnd)) ok = false;
+      }
+      check("下午：第 3 条保底仍在时段内", ok);
+
+      ok = true;
+      for (let i = 0; i < 100; i++) {
+        const at = planProactiveAt(a, 3, aStart, aStart);
+        if (at === null || at < aStart + 1.5 * 3_600e3 || at > aStart + 3 * 3_600e3) ok = false;
+      }
+      check("下午：保底满后随机，间隔 1.5~3 小时", ok);
+
+      const late = new Date(2026, 9, 28, 17, 40, 0, 0).getTime();
+      check("时段末尾：随机那条排不进就不排", planProactiveAt(a, 3, late, late) === null);
+
+      const tight = new Date(2026, 9, 28, 15, 50, 0, 0).getTime();
+      check(
+        "时间不够铺开：退到 1 小时后，不连发",
+        planProactiveAt(a, 2, tight, tight) === tight + 3_600e3,
+        String(planProactiveAt(a, 2, tight, tight) - tight)
+      );
+      const lastMinute = new Date(2026, 9, 28, 17, 30, 0, 0).getTime();
+      check("临近收尾且刚说过：本时段不再发", planProactiveAt(a, 2, lastMinute, lastMinute) === null);
+    } finally {
+      CFG.proactiveQuietStart = s0;
+      CFG.proactiveQuietEnd = e0;
+    }
+  }
+
   // extractStickerRequest：标记剥净、只取第一个关键词、全角冒号也认
   {
     const r1 = extractStickerRequest("你看这个 [[sticker:开心]] 哈哈");
@@ -8396,12 +8476,18 @@ function selftest() {
       const d = loadSchedule(tmp).diary;
       check("回滚：diary count 减回且 planAt 恢复", d.count === 0 && d.planAt > Date.now(), JSON.stringify(d));
 
-      // proactive：count 减回，lastAt 更新为现在，不动 planAt 字段
-      saveSchedule({ proactive: { day, count: 2, lastAt: 123, nextGapH: 4 } }, tmp);
+      // proactive：count/total 减回，planAt 推到 15 分钟后
+      saveSchedule({ proactive: { day, count: 2, total: 2, lastAt: 123, planAt: null } }, tmp);
       rollbackQuota("proactive", day, tmp);
       const p = loadSchedule(tmp).proactive;
       check("回滚：proactive count 减回", p.count === 1, JSON.stringify(p));
+      check("回滚：proactive total 减回", p.total === 1, JSON.stringify(p));
       check("回滚：proactive lastAt 记为现在", p.lastAt > Date.now() - 60e3, String(p.lastAt));
+      check(
+        "回滚：proactive 15 分钟后重试",
+        p.planAt > Date.now() + 14 * 60e3 && p.planAt < Date.now() + 16 * 60e3,
+        String(p.planAt && p.planAt - Date.now())
+      );
 
       // 换天的状态不动（防误回滚昨天）
       saveSchedule({ qzone: { day: "2099-01-02", count: 1, planAt: null } }, tmp);
@@ -9496,7 +9582,7 @@ log(
 log(
   `[cfg] 主动消息: ${
     CFG.proactiveEnabled
-      ? `开（间隔 ${CFG.proactiveMinGapHours}~${CFG.proactiveMaxGapHours} 小时随机，静默 ${CFG.proactiveQuietStart}~${CFG.proactiveQuietEnd} 点，每天最多 ${CFG.proactiveDailyMax} 条）`
+      ? `开（上午 ${CFG.proactiveMorningMin}~${CFG.proactiveMorningMax} 条；下午保底 ${CFG.proactiveAfternoonMin} 条、晚上保底 ${CFG.proactiveEveningMin} 条，之后每 ${CFG.proactiveExtraMinGapH}~${CFG.proactiveExtraMaxGapH} 小时随机；静默 ${CFG.proactiveQuietStart}~${CFG.proactiveQuietEnd} 点；全天最多 ${CFG.proactiveDailyMax} 条）`
       : "关"
   }`
 );
@@ -9546,7 +9632,7 @@ function saveSchedule(next, path) {
  * 配额回滚（2026-10-22 审计修复 F-01）。
  * scheduleTick 是「先扣配额后执行」，执行异常失败时把配额还回去：
  * - qzone/diary：count 减回，planAt 恢复成 30 分钟后（限 retries<2，防整夜掉线时每 30 分钟白烧一次积分）；
- * - proactive：count 减回，lastAt 记为现在（等下一个自然间隔，不立即重试）。
+ * - proactive：count/total 减回，planAt 推到 15 分钟后（不立即重试，免得每 5 分钟烧一次）。
  * 「内容为空跳过」不算失败、不回滚——否则空内容会每 5 分钟重试刷屏。
  */
 function rollbackQuota(kind, day, path) {
@@ -9557,7 +9643,14 @@ function rollbackQuota(kind, day, path) {
     if (!cur || cur.day !== day) return;
     const retries = (Number(cur.retries) || 0) + 1;
     if (kind === "proactive") {
-      st[kind] = { ...cur, count: Math.max(0, (Number(cur.count) || 0) - 1), lastAt: Date.now() };
+      st[kind] = {
+        ...cur,
+        count: Math.max(0, (Number(cur.count) || 0) - 1),
+        total: Math.max(0, (Number(cur.total) || 0) - 1),
+        lastAt: Date.now(),
+        // 失败别立刻重排：15 分钟后再试，免得每 5 分钟烧一次
+        planAt: Date.now() + 15 * 60 * 1000,
+      };
     } else if (retries <= 2) {
       st[kind] = {
         ...cur,
@@ -9627,6 +9720,83 @@ function inQuietHours(hour = new Date().getHours()) {
 function randBetween(a, b) {
   if (!(b > a)) return a;
   return a + Math.random() * (b - a);
+}
+
+// ── 主动消息的时段配额（2026-10-28 老大口径）──────────────────────────
+// 上午 1~2 条；下午保底 3 条、之后随机；晚上保底 2 条、之后随机。
+// 时段边界见文件上方 PROACTIVE_* 常量。
+
+/** 当前小时落在哪个时段；静默时段返回 null */
+function proactivePeriodOf(hour) {
+  if (inQuietHours(hour)) return null;
+  if (hour < PROACTIVE_MORNING_END) {
+    return {
+      key: "morning",
+      startHour: CFG.proactiveQuietEnd,
+      endHour: PROACTIVE_MORNING_END,
+      min: CFG.proactiveMorningMin,
+      max: CFG.proactiveMorningMax,
+    };
+  }
+  if (hour < PROACTIVE_AFTERNOON_END) {
+    return {
+      key: "afternoon",
+      startHour: PROACTIVE_AFTERNOON_START,
+      endHour: PROACTIVE_AFTERNOON_END,
+      min: CFG.proactiveAfternoonMin,
+      max: Infinity,
+    };
+  }
+  if (hour < 24) {
+    return {
+      key: "evening",
+      startHour: PROACTIVE_EVENING_START,
+      endHour: 24,
+      min: CFG.proactiveEveningMin,
+      max: Infinity,
+    };
+  }
+  return null;
+}
+
+/** 时段在今天的时间范围（毫秒时间戳） */
+function proactivePeriodBounds(win, now) {
+  const d0 = new Date(now);
+  d0.setHours(0, 0, 0, 0);
+  return {
+    start: d0.getTime() + win.startHour * 3_600_000,
+    end: d0.getTime() + win.endHour * 3_600_000,
+  };
+}
+
+/**
+ * 算本时段下一条消息的计划时刻，null = 本时段不再发。
+ * 保底阶段铺在时段前 60%，随机阶段按「距上一条 1~2.5 小时」。
+ * 时间不够铺开时返回 now，宁可挤一点也不能漏保底。
+ */
+function planProactiveAt(win, count, lastAt, now) {
+  if (count >= win.max) return null;
+  const { start, end } = proactivePeriodBounds(win, now);
+  const from = Math.max(now, start);
+  if (from >= end) return null;
+
+  if (count < win.min) {
+    const remaining = win.min - count;
+    const usableEnd = Math.min(end, start + (end - start) * PROACTIVE_BASELINE_SPAN);
+    const room = Math.max(0, usableEnd - from);
+    const slot = room / remaining;
+    // 和上一条（含上一个时段的）至少隔 1 小时，别刚说完又开口
+    const earliest = Math.max(from + 5 * 60 * 1000, (Number(lastAt) || 0) + PROACTIVE_BASELINE_GAP_MS);
+    const latest = Math.min(from + slot, end - (remaining - 1) * PROACTIVE_BASELINE_GAP_MS);
+    if (latest > earliest) return Math.round(randBetween(earliest, latest));
+    // 时间不够铺开：退到「最快能发的时刻」，但绝不打破 1 小时间隔；
+    // 连这个时刻都落到时段外就不发（少一条保底，好过连发两条刷屏）。
+    return earliest < end ? Math.round(earliest) : null;
+  }
+
+  const lo = Math.min(CFG.proactiveExtraMinGapH, CFG.proactiveExtraMaxGapH);
+  const at = (lastAt || from) + randBetween(lo, CFG.proactiveExtraMaxGapH) * 3_600_000;
+  return at < end ? Math.round(at) : null;
 }
 
 let proactiveBusy = false;
@@ -9748,30 +9918,52 @@ function scheduleTick() {
   const day = dayKey(now);
   const st = loadSchedule();
 
-  // —— 主动消息 ——
+  // —— 主动消息（上午 / 下午 / 晚上分时段配额）——
   if (CFG.proactiveEnabled) {
     const p = st.proactive ?? {};
-    const count = p.day === day ? Number(p.count) || 0 : 0;
-    const lastAt = Number(p.lastAt) || 0;
-    const nextGapH = Number(p.nextGapH) || randBetween(CFG.proactiveMinGapHours, CFG.proactiveMaxGapHours);
+    const win = proactivePeriodOf(now.getHours());
+    const sameDay = p.day === day;
+    const samePeriod = sameDay && p.period === (win?.key ?? null);
 
-    // 换天了：重置计数并重新抽一个间隔
-    if (p.day !== day) {
-      st.proactive = { day, count, lastAt, nextGapH };
+    // 换天 / 换时段（含进出静默）：本时段计数归零，重新排
+    if (!sameDay) {
+      st.proactive = {
+        day,
+        period: win?.key ?? null,
+        count: 0,
+        total: 0,
+        lastAt: 0,
+        planAt: null,
+        finished: false,
+      };
+      saveSchedule(st);
+    } else if (!samePeriod) {
+      st.proactive = { ...p, period: win?.key ?? null, count: 0, planAt: null, finished: false };
       saveSchedule(st);
     }
 
-    if (!inQuietHours(now.getHours()) && count < CFG.proactiveDailyMax) {
-      const elapsedH = lastAt ? (Date.now() - lastAt) / 3_600_000 : Infinity;
-      if (elapsedH >= nextGapH) {
-        st.proactive = {
-          day,
-          count: count + 1,
-          lastAt: Date.now(),
-          nextGapH: randBetween(CFG.proactiveMinGapHours, CFG.proactiveMaxGapHours),
-        };
+    const cur = st.proactive;
+    const total = Number(cur.total) || 0;
+    if (win && !cur.finished && total < CFG.proactiveDailyMax) {
+      if (!cur.planAt) {
+        const at = planProactiveAt(win, Number(cur.count) || 0, Number(cur.lastAt) || 0, Date.now());
+        if (at == null) {
+          st.proactive = { ...cur, finished: true };
+          saveSchedule(st);
+          log(`[proactive] ${win.key} 本时段不再发（已发 ${Number(cur.count) || 0} 条）`);
+        } else {
+          st.proactive = { ...cur, planAt: at };
+          saveSchedule(st);
+          log(`[proactive] ${win.key} 下一条计划在 ${new Date(at).toLocaleTimeString("zh-CN", { hour12: false })}`);
+        }
+      } else if (Date.now() >= Number(cur.planAt)) {
+        const nextCount = (Number(cur.count) || 0) + 1;
+        st.proactive = { ...cur, count: nextCount, total: total + 1, lastAt: Date.now(), planAt: null };
         saveSchedule(st);
-        const why = elapsedH === Infinity ? "今天还没说过话" : `距上次 ${elapsedH.toFixed(1)} 小时`;
+        const why =
+          nextCount <= win.min
+            ? `${win.key} 保底第 ${nextCount}/${win.min} 条`
+            : `${win.key} 随机一条`;
         // F-01（2026-10-22）：执行异常失败 → 回滚配额（runProactive 返回 false）
         runProactive(why).then((ok) => { if (ok === false) rollbackQuota("proactive", day); });
       }

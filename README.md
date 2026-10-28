@@ -309,9 +309,11 @@ sudo systemctl daemon-reload && sudo systemctl enable --now qq-bot
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PROACTIVE_ENABLED` | `1` | 定时搭话 |
-| `PROACTIVE_MIN_GAP_H` / `PROACTIVE_MAX_GAP_H` | `3` / `6` | 间隔随机区间（小时） |
+| `PROACTIVE_MORNING_MIN` / `PROACTIVE_MORNING_MAX` | `1` / `2` | 上午条数区间 |
+| `PROACTIVE_AFTERNOON_MIN` / `PROACTIVE_EVENING_MIN` | `3` / `2` | 下午 / 晚上保底条数 |
+| `PROACTIVE_EXTRA_MIN_GAP_H` / `PROACTIVE_EXTRA_MAX_GAP_H` | `1.5` / `3` | 保底发完后的随机间隔（小时） |
 | `PROACTIVE_QUIET_START` / `PROACTIVE_QUIET_END` | `0` / `8` | 静默时段 |
-| `PROACTIVE_DAILY_MAX` | `4` | 每天上限 |
+| `PROACTIVE_DAILY_MAX` | `12` | 全天硬上限 |
 | `QZONE_ENABLED` / `QZONE_DRY_RUN` | `1` / `0` | 自动说说 / 只演练不真发 |
 | `QZONE_RIGHT` | `4` | 1 所有人 / 4 好友 / 64 仅自己 |
 | `DIARY_ENABLED` | `1` | 自动写日记 |
