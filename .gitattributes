@@ -1,0 +1,22 @@
+# 换行符统一：Linux 上跑的脚本必须是 LF，
+# 历史上 .bat 存成 LF 让 cmd 报过 'EM' is not recognized，反向同理。
+* text=auto
+
+*.sh  text eol=lf
+*.mjs text eol=lf
+*.js  text eol=lf
+*.py  text eol=lf
+*.json text eol=lf
+*.md  text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.exe binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.gz  binary

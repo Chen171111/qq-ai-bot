@@ -1,0 +1,42 @@
+# 依赖 / 虚拟环境
+node_modules/
+.venv-sing/
+.venv-soulx/
+__pycache__/
+.npm-cache/
+
+# 运行时数据：图片、音频、日志、清单、黄金副本
+.run/
+*.log
+
+# 预训练模型与打包产物（合计 7.5G / 19M）
+pretrained_models/
+deploy/dist/
+
+# pip 临时目录
+pip-*/
+tmp*/
+
+# NapCat 程序本体（第三方，按需自行下载）
+/NapCat/
+# NapCat 实际配置（文件名带 QQ 号，可能带 token）
+deploy/napcat/config/
+
+# 本地备份
+*.bak*
+*.server-copy
+
+# 凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.credentials.yaml
+
+# 公开导出副本
+qqbot-public/
+
+# 系统垃圾
+Thumbs.db
+.DS_Store

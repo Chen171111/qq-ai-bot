@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily dsh session trash cleanup (04:17)
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=600
+Persistent=true
+Unit=qq-bot-cleanup.service
+
+[Install]
+WantedBy=timers.target

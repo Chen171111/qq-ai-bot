@@ -1,0 +1,7 @@
+[Unit]
+Description=NapCat 3001 watchdog (one-shot check)
+After=napcat.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/napcat-watchdog.sh

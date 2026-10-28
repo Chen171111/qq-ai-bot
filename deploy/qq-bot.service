@@ -1,0 +1,18 @@
+[Unit]
+Description=QQ AI Bot (bridge -> dsh headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qq-bot
+EnvironmentFile=/etc/qq-bot.env
+ExecStart=/opt/node/bin/node /opt/qq-bot/bridge.mjs
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

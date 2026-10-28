@@ -1,0 +1,11 @@
+[Unit]
+Description=Run NapCat 3001 watchdog every 30s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=napcat-watchdog.service
+
+[Install]
+WantedBy=timers.target

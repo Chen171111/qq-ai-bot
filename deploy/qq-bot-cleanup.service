@@ -1,0 +1,7 @@
+[Unit]
+Description=dsh session trash cleanup (older than 7 days)
+
+[Service]
+Type=oneshot
+Environment=RETENTION_DAYS=7
+ExecStart=/usr/local/bin/cleanup-sessions-trash.sh

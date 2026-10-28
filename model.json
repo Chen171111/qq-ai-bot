@@ -1,0 +1,6 @@
+{
+  "provider": "qodercn",
+  "model": "dfmodel",
+  "reasoningEffort": "high",
+  "fallbacks": []
+}
