@@ -123,6 +123,11 @@ const CFG = {
   // 合并上限：攒太久也不能无限等。必须显著大于静默窗口，否则连发到第 6 秒
   // 就被上限强行放行、5 秒静默等于没设。20 秒 ≈ 6 条 × 3 秒间隔。
   mergeBurstMaxMs: Number(process.env.MERGE_BURST_MAX_MS ?? 20000),
+  // 合并后整轮图片封顶。DSH 单条消息图片上限默认 20（dsh-attachment-local，
+  // profile 未覆盖），而合并把多条的帧 flatMap 到一起会绕过每条 maxTotal=10 的
+  // 局部帽：2026-11-02 01:08 实炸——4 个动图 ×6 帧 = 24 > 20，请求在准入层被
+  // 硬拒（TOO_MANY_IMAGES），整轮失败。留 2 张余量给静态图/边界，封顶 18。
+  mergeMaxImages: Number(process.env.MERGE_MAX_IMAGES ?? 18),
 
   // ── 连续回复（2026-10-22 17:0x 新增）────────────────────────────────
   // 老大要「很活泼地回复两三句」。机制：模型用 [[分]] 标记把回复拆成几条，
@@ -1623,11 +1628,56 @@ function isTextDuplicate(userId, text, hasImages, now = Date.now()) {
 // 模型需要看见「他是分几条打的」这个事实（buildDshPrompt 里也会提示）。
 const burstBuf = new Map(); // userId -> { items:[{text,images,stickerOnly}], timer, startedAt, firstAt }
 
+/**
+ * 均匀抽帧：保头保尾、中间等间隔（纯函数，便于自测）。
+ * 帧分组话术要模型说「开头→中间→最后」，只留前几帧会丢掉结尾，
+ * 所以降帧不能简单 slice(0, keep)，得等间隔采样。
+ */
+function sampleFrames(paths, keep) {
+  if (paths.length <= keep) return paths;
+  if (keep <= 1) return [paths[0]];
+  const step = (paths.length - 1) / (keep - 1);
+  const out = [];
+  for (let i = 0; i < keep; i++) out.push(paths[Math.round(i * step)]);
+  return out;
+}
+
+/**
+ * 合并后整轮图片封顶（纯函数，便于自测）。
+ * 背景见 CFG.mergeMaxImages：合并的 flatMap 会绕过每条 maxTotal=10 的局部帽，
+ * 2026-11-02 01:08 实炸——4 个动图 ×6 帧 = 24 > DSH 上限 20，请求在准入层被
+ * 硬拒（TOO_MANY_IMAGES），整轮失败、只回「网络抽风」。
+ * 超预算时按动图分组均匀降帧：每个表情都还在、帧仍连续（分组话术依赖连续性），
+ * 静态图原样保留；降帧后仍超（极端 20+ 个动图）才截断兜底。
+ * ≤ 预算时原样返回，不动常见路径（1~3 个动图 = 6/12/18 张）。
+ */
+function capMergedImages(images, budget) {
+  if (images.length <= budget) return images;
+  const groups = [];
+  for (const p of images) {
+    const m = basename(p).match(/^(.+)-f(\d+)\.png$/i);
+    const last = groups[groups.length - 1];
+    if (m && last && last.stem === m[1]) last.paths.push(p);
+    else if (m) groups.push({ stem: m[1], paths: [p] });
+    else groups.push({ stem: null, paths: [p] }); // 静态图各自一组
+  }
+  const anim = groups.filter((g) => g.stem !== null);
+  if (anim.length === 0) return images.slice(0, budget); // 全静态，直接截
+  const staticN = images.length - anim.reduce((s, g) => s + g.paths.length, 0);
+  const perAnim = Math.max(1, Math.floor((budget - staticN) / anim.length));
+  const out = [];
+  for (const g of groups) {
+    if (g.stem === null) out.push(...g.paths);
+    else out.push(...sampleFrames(g.paths, perAnim));
+  }
+  return out.slice(0, budget);
+}
+
 /** 把这一阵攒下的消息摊成一轮（纯函数，便于自测）。 */
-function mergeBurstItems(items) {
+function mergeBurstItems(items, budget = CFG.mergeMaxImages) {
   return {
     text: items.map((x) => x.text).join("\n"),
-    images: items.flatMap((x) => x.images),
+    images: capMergedImages(items.flatMap((x) => x.images), budget),
     // 全是表情包才按表情包处理；混了文字就按正常聊天
     stickerOnly: items.every((x) => x.stickerOnly),
   };
@@ -4556,7 +4606,12 @@ async function replyTo(target, text, images = [], flags = {}) {
       // 2026-10-18 21:40 实测：把 dsh 的 UNKNOWN_MODEL 原文发给老大，
       // 半句话被截断，除了吓人零信息量。
       // 群聊不报错：一句网络故障发到群里，对谁都没用。
-      await sendTo(tgt, "（这边网络抽风了，没接上模型。老大再说一句试试～）");
+      // 2026-11-02：图太多被 DSH 准入层硬拒（TOO_MANY_IMAGES）不是网络问题，
+      // 一律说「网络抽风」会误导老大以为是网断了、重试也没用。分开说。
+      const tooMany = /TOO_MANY_IMAGES|image-count limit|Image batch exceeds/i.test(e.message);
+      await sendTo(tgt, tooMany
+        ? "（这一批图太多了，我一次看不过来。老大少发几张、或者分开发试试～）"
+        : "（这边网络抽风了，没接上模型。老大再说一句试试～）");
     }
     return;
   }
@@ -8124,6 +8179,45 @@ function selftest() {
       { text: "[表情]", images: ["b.jpg"], stickerOnly: true },
     ]);
     check("合并表情：全是表情包才按表情包走", mergeStickers.stickerOnly === true && mergeStickers.images.length === 2);
+
+    // ── 合并图片封顶（2026-11-02 01:08：4 动图 ×6 帧 = 24 > DSH 上限 20 被硬拒）──
+    // 测试路径用正斜杠：服务器是 Linux，basename 不认反斜杠分隔符；正斜杠在
+    // Windows（win32 basename 同时认 / 和 \）和 Linux 上行为一致，且贴合服务器真实帧路径。
+    {
+      const mkAnim = (stem) => Array.from({ length: 6 }, (_, i) => `/tmp/ani/${stem}-f0${i + 1}.png`);
+      const stemOf = (p) => basename(p).match(/^(.+)-f\d+\.png$/i)[1];
+      const four = [...mkAnim("a"), ...mkAnim("b"), ...mkAnim("c"), ...mkAnim("d")]; // 24 张
+      check("封顶前确实是 24 张（4 动图 ×6 帧）", four.length === 24);
+      const capped = capMergedImages(four, 18);
+      check("合并封顶：24 张降到 ≤18（不再撞 DSH 上限）", capped.length <= 18);
+      check("合并封顶：4 个动图都还在，不整个丢表情", ["a", "b", "c", "d"].every((s) => capped.some((p) => stemOf(p) === s)));
+      check("合并封顶：每个动图均匀降到 4 帧（floor(18/4)）", capped.filter((p) => stemOf(p) === "a").length === 4);
+      check("合并封顶：帧仍按动图连续（分组话术依赖连续性）", capped.map(stemOf).join(",") === "a,a,a,a,b,b,b,b,c,c,c,c,d,d,d,d");
+      const aFrames = capped.filter((p) => stemOf(p) === "a").map((p) => basename(p));
+      check("降帧采样：保住第一帧", aFrames[0] === "a-f01.png");
+      check("降帧采样：保住最后一帧", aFrames[aFrames.length - 1] === "a-f06.png");
+      // ≤ 预算原样返回（同一引用），不动常见路径
+      const two = [...mkAnim("a"), ...mkAnim("b")]; // 12 张
+      check("合并封顶：12 张 ≤18 原样返回、不重排", capMergedImages(two, 18) === two);
+      // 静态图不丢
+      const mixed = ["/x/photo.jpg", ...mkAnim("a"), ...mkAnim("b"), ...mkAnim("c"), "/y/pic.png"]; // 2 静态 + 18 帧 = 20
+      const cappedMixed = capMergedImages(mixed, 18);
+      check("合并封顶：静态图原样保留", cappedMixed.includes("/x/photo.jpg") && cappedMixed.includes("/y/pic.png"));
+      check("合并封顶：混合也封到 ≤18", cappedMixed.length <= 18);
+      // sampleFrames 纯函数边界
+      check("sampleFrames：不超 keep 原样返回", sampleFrames(["1", "2", "3"], 5).length === 3);
+      check("sampleFrames：keep=1 只留头", sampleFrames(["1", "2", "3"], 1).join() === "1");
+      check("sampleFrames：等间隔保头保尾", sampleFrames(["1", "2", "3", "4", "5"], 3).join() === "1,3,5");
+      // 走 mergeBurstItems 全链路（默认预算 = CFG.mergeMaxImages）
+      const mergedCap = mergeBurstItems([
+        { text: "[表情]", images: mkAnim("a"), stickerOnly: true },
+        { text: "[表情]", images: mkAnim("b"), stickerOnly: true },
+        { text: "[表情]", images: mkAnim("c"), stickerOnly: true },
+        { text: "[表情]", images: mkAnim("d"), stickerOnly: true },
+      ]);
+      check("mergeBurstItems：4 动图合并后封到 ≤18", mergedCap.images.length <= 18);
+      check("mergeBurstItems：默认预算取 CFG.mergeMaxImages=18", CFG.mergeMaxImages === 18);
+    }
 
     const photo = buildDshPrompt("u1", "[图片]", [], fakeImg, null, true, "chat", {});
     check("普通图：仍要求说信息", /图里真正有用的东西/.test(photo));
