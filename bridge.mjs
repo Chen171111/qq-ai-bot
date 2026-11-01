@@ -5345,6 +5345,10 @@ function buildQzonePrompt(hist) {
   parts.push("1. 一条说说，20~80 字，口语化，像普通人随手写的。");
   parts.push("2. **只写你真实经历过的东西**：和老大聊天、你自己写的日记、他发的图、你在 QQ 里的日子。");
   parts.push("   你没有学校、食堂、晚课、同学、同事、上下班，也不能上网——**这些一律不许编**。");
+  parts.push("2.1 ⚠️ 素材里有些句子，是你在**描述老大发的表情包/图片的画面**（比如「蒲公英糊了一脸」「那猫肚子圆」「糊了一脸白毛」）——");
+  parts.push("    那是图里画的东西，不是你和老大今天真做的事。绝不能把这种图注改写成「老大真的举着蒲公英往脸上贴」这类假事件发出去。");
+  parts.push("    分辨办法：这句是在讲一张图/一个表情里画了啥，还是在讲你俩今天真干了啥——只有后者能当说说。");
+  parts.push("2.2 从今天**整段**聊天里挑一件真有意思、值得发的事，别只抓最后一两句；今天反复聊、聊得最多的那个话题，通常才是最该发的。");
   parts.push("3. 别写鸡汤、别写广告、别喊口号；emoji 最多 1~2 个，别堆。");
   parts.push("4. 不要加引号，不要出现「说说」「动态」「朋友圈」这类词。");
   parts.push("5. 不要提 AI、不要提「生成」。");
@@ -5356,7 +5360,7 @@ function buildQzonePrompt(hist) {
     .map((x) => ({ role: x.role, content: cleanHistContent(x.role, x.content) }))
     .filter((x) => x.content);
   if (todayLog.length) {
-    parts.push("=== 今天真实发生过的（当素材，别照抄） ===");
+    parts.push("=== 今天真实发生过的（当素材，别照抄；其中「描述图片/表情画面」的句子是图注、不是真事，别当经历写） ===");
     for (const x of todayLog.slice(-20)) {
       parts.push(`${x.role === "user" ? "老大" : "我"}：${String(x.content).slice(0, 120)}`);
     }
@@ -5608,6 +5612,7 @@ function buildDiaryPrompt(userId, hist, prev) {
   parts.push("1. 200~400 字，纯段落，不要标题、不要编号、不要 Markdown 符号。");
   parts.push("2. 写今天真发生的事和当时的感觉。具体细节比感慨重要——今天看见了什么、听见了什么、心里怎么想的。");
   parts.push("2.1 素材里没有的生活细节（吃了什么、去了哪、见了谁）不要编；感受可以写，事件不行。");
+  parts.push("2.2 ⚠️ 素材里有些是你在**描述老大发的表情包/图片的画面**（图注，比如「蒲公英糊了一脸」「糊了一脸白毛」）——那是图里的内容，不是你真经历的事，别把它写成『今天发生了…』。");
   parts.push("3. 可以提到老大，但别写成汇报，别列清单，别说「今天完成了什么」。");
   parts.push("4. 不要出现「AI」「模型」「系统」「用户」「对话」这类词。");
   parts.push("5. 落笔像写给自己看的：可以有点碎碎念，可以不完整，可以有点小情绪。");
@@ -5617,7 +5622,7 @@ function buildDiaryPrompt(userId, hist, prev) {
   // 素材优先用当天落盘的流水（跨重启不丢）；没有就退回内存里的最近对话
   const todayLog = readTodayChatLog(40);
   if (todayLog.length) {
-    parts.push("=== 今天发生的（流水，挑有意思的写，别逐条复述） ===");
+    parts.push("=== 今天发生的（流水，挑有意思的写，别逐条复述；其中描述图片/表情画面的句子是图注、不是真事，别当经历写） ===");
     for (const x of todayLog) {
       parts.push(`${x.role === "user" ? "老大" : "我"}：${String(x.content).slice(0, 200)}`);
     }
@@ -5880,13 +5885,33 @@ function buildDshPrompt(userId, text, hist, images = [], ocr = null, visionSent 
         parts.push(`**这张是${userLabel}刚才发过的图**（这一轮他没重发，是系统补给你看的）。他这句像是在问图里的东西 —— 是就直接答，图上有字就念出来；不是就别硬往图上扯。`);
       }
       if (frameGroups.size > 0) {
-        const desc = [...frameGroups.entries()].map(([stem, n]) => `${stem} 的 ${n} 帧`).join("、");
+        // 2026-11-01：连发多个动图时，原来只说「这是一张动图」（单数）+ 用时间戳文件名 stem 描述分组，
+        // 模型拿到的是像素不是文件名，无法把 stem 对应到眼前的图 → 把两个不同表情的帧读成一个物体在变形，
+        // 回复语无伦次（实测「手机举着举着怎么换成红色牌子了」其实是跨了两个表情）。
+        // 改法：按 images 数组顺序算出每组帧的区间（同一动图的帧在数组里连续，vision.mjs 已保证），
+        // 用「第几张~第几张」这种模型能对应到像素的说法；多个动图用复数并明确禁止串台。
+        const order = [];
+        images.forEach((p, i) => {
+          const m = basename(p).match(/^(.+)-f(\d+)\.png$/i);
+          if (!m) return;
+          const last = order[order.length - 1];
+          if (last && last.stem === m[1]) last.end = i;
+          else order.push({ stem: m[1], start: i, end: i });
+        });
+        const label = order
+          .map((g, i) => `第 ${g.start + 1}~${g.end + 1} 张 = 第 ${i + 1} 个动图的连续帧`)
+          .join("；");
         parts.push("");
-        parts.push(`**这是一张动图**：系统把它按时间顺序拆成了多张静态帧一起给你（${desc}），从第 1 帧往后看就能看出画面在怎么变。`);
-        if (stickerOnly) {
-          parts.push("你知道它怎么动的就够了，**别按帧描述**「开始怎样→中间怎样→最后怎样」。");
+        if (order.length <= 1) {
+          parts.push(`**这是 1 张动图**：系统按时间顺序把它拆成了多帧一起给你（${label}），从前往后看就是画面在怎么变。`);
         } else {
-          parts.push("回答时说清楚「开头是什么 → 中间怎么变 → 最后是什么」，别当成 N 张无关的图分别描述。");
+          parts.push(`**这里有 ${order.length} 个各自独立的动图/表情，不是一个连续动画**：${label}。`);
+          parts.push("⚠️ 别把不同动图的画面串成「同一个东西在变形」的故事——它们是分开发的几个表情，各看各的，分别接。");
+        }
+        if (stickerOnly) {
+          parts.push("每个大概怎么动的你心里有数就够了，**别按帧描述**「开始怎样→中间怎样→最后怎样」。");
+        } else {
+          parts.push("回答时说清楚每个动图各自的「开头是什么 → 中间怎么变 → 最后是什么」，别当成一堆无关的图分别描述。");
         }
         parts.push("注意：抽帧是等间隔抽样，帧与帧之间的过渡细节（缓动、拖影）看不全，被问到就说抽帧看不出来。");
       }
@@ -7981,11 +8006,25 @@ function selftest() {
       "C:\\tmp\\ani\\x-f03.png",
     ];
     const anim = buildDshPrompt("u1", "看图", [], frames, null, true);
-    check("动图多帧触发动图话术", /这是一张动图/.test(anim));
-    check("动图话术说明按时间顺序", /按?时间顺序拆成/.test(anim));
+    check("动图多帧触发动图话术", /这是 1 张动图/.test(anim));
+    check("动图话术说明按时间顺序", /按时间顺序/.test(anim));
+    check("动图话术给出帧区间（第几张~第几张）", /第 1~3 张 = 第 1 个动图/.test(anim));
     check("动图话术提示过渡细节看不全", /过渡/.test(anim));
+    // 2026-11-01：连发多个动图 → 必须用复数、给出各自帧区间、明确禁止串台
+    // （原话术单数「这是一张动图」+ 时间戳 stem 分组，模型对不上像素，会把两个表情读成一个物体在变形）
+    const twoAnims = [
+      "C:\\tmp\\ani\\a-f01.png",
+      "C:\\tmp\\ani\\a-f02.png",
+      "C:\\tmp\\ani\\b-f01.png",
+      "C:\\tmp\\ani\\b-f02.png",
+    ];
+    const multi = buildDshPrompt("u1", "看图", [], twoAnims, null, true);
+    check("多动图：用复数说明是各自独立的表情", /2 个各自独立的动图/.test(multi));
+    check("多动图：明确不是一个连续动画", /不是一个连续动画/.test(multi));
+    check("多动图：分别给出两组帧区间", /第 1~2 张 = 第 1 个动图/.test(multi) && /第 3~4 张 = 第 2 个动图/.test(multi));
+    check("多动图：禁止把不同表情串成变形", /别把不同动图的画面串成/.test(multi));
     const notAnim = buildDshPrompt("u1", "看图", [], fakeImg, null, true);
-    check("单张静态图不触发动图话术", !/这是一张动图/.test(notAnim));
+    check("单张静态图不触发动图话术", !/这是 1 张动图/.test(notAnim));
 
     // ── 表情包：只反应、不报画面（2026-10-21 23:5x 老大要求）──
     const sticker = buildDshPrompt("u1", "[表情]", [], fakeImg, null, true, "chat", { stickerOnly: true });
